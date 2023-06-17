@@ -1,3 +1,1 @@
-These are the IESNA 1995 files for MPI building project
-describing far-field photometry of illuminaires.
-
+These are IESNA files, some from the MPI building project and others from the manufacturer CREE Inc.
