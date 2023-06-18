@@ -8,7 +8,9 @@ Original file is located at
 """
 
 import re                         # function to open plain files
-import imageio                    # function to save EXR files
+import os                         # function to save EXR files
+os.environ["OPENCV_IO_ENABLE_OPENEXR"]="1"
+import imageio                    # function to open EXR files
 import cv2                        # computer vision library (open images, etc.)
 import numpy as np                # functions for arrays
 
