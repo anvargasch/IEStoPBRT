@@ -23,18 +23,17 @@ def load_IES(filename):
         content = file.read()
     match = re.search(r'TILT=', content)
     if not match:
-        raise ValueError('Formato de archivo IES no válido')
+        raise ValueError('Incorrect IES file does not meet photometric file parameters')
+        return 0, 0
     else:
       file=content.splitlines()
       index=0
-      #print(len(file))
       for x in range(len(file)):
-        #print(file[x])
         match = re.search(r'TILT=', file[x])
         if match:
           index=x
           x=len(file)
-    return file, index # devuelve una lista con el archivo fotométrico e indice en donde inicia TILT
+      return file, index # Returns a list with the photometric file and index where TILT starts.
 
 def header(IES, index):
     val=IES[index+1].split()
@@ -42,38 +41,45 @@ def header(IES, index):
     fact=val[2]
     Num_vert_angle=int(val[3])
     Num_hori_angle=int(val[4])
-    unid=int(val[6]) # 1 para pies o 2 para metros
-    return (Lumen,fact,Num_vert_angle,Num_hori_angle,unid) # devuelve parametros de la fotometría
+    unid=int(val[6]) # 1 for feet or 2 for meters
+    return (Lumen,fact,Num_vert_angle,Num_hori_angle,unid) # Returns photometric parameters
 
 def angles (file,index,num):
-    aux=file[index].split()
-    angle=np.array(aux)
-    N_index = index +1
-    N_angles=len(aux)
-    if N_angles<num:
-      for x in range(len(file)-index):
-        aux=file[N_index].split()
-        angle2=np.array(aux)
-        N_angles=N_angles+len(aux)
-        N_index = N_index +1
-        angle = np.concatenate((angle, angle2), axis=0)
-        if N_angles>=num:
-          break
-    angle = np.asarray(angle, dtype=float)
+  aux=file[index].split()
+  angle=np.array(aux)
+  N_index = index +1
+  N_angles=len(aux)
+  if N_angles<num:
+    for x in range(len(file)-index):
+      aux=file[N_index].split()
+      angle2=np.array(aux)
+      N_angles=N_angles+len(aux)
+      N_index = N_index +1
+      angle = np.concatenate((angle, angle2), axis=0)
+      if N_angles>=num:
+        break
+  angle = np.asarray(angle, dtype=float)
+  if angle.shape[0]==num:
     return angle, N_index
+  else:
+    raise ValueError("Incorrect IES file, the number of angles does not match")
+    return angle, 0
 
 def intensity_matrix (file,index,num_ver,num_hor):
-    N_index = index
-    mat=file[N_index].split()
-    for x in range(len(file)-index-1):
-      #print(N_index)
-      N_index = N_index +1
-      aux=file[N_index].split();
-      mat=np.concatenate((mat, aux), axis=0)
+  N_index = index
+  mat=file[N_index].split()
+  for x in range(len(file)-index-1):
+    #print(N_index)
+    N_index = N_index +1
+    aux=file[N_index].split();
+    mat=np.concatenate((mat, aux), axis=0)
+  if len(mat)==num_hor*num_ver:
     mat=np.resize(mat,(num_hor,num_ver))
-    #print("Angulos Horizontales :",angle )
     mat = np.asarray(mat, dtype=float)
     return mat.T
+  else:
+    raise ValueError("Incorrect IES file, the number of angles does not match the header")
+    return 0
 
 
 def adjust_vert_angle(mat,angle_vertical,Num_vert_angle,Num_hori_angle):
@@ -137,8 +143,10 @@ def IES_header(filename):
   IES, index = load_IES(filename)
   if index!=0:
     Lumen,fact,Num_vert_angle,Num_hori_angle,unid = header(IES, index)
-  return Lumen,fact,Num_vert_angle,Num_hori_angle,unid
-
+    return Lumen,fact,Num_vert_angle,Num_hori_angle,unid
+  else:
+    raise ValueError("Incorrect IES file does not meet photometric file parameters")
+    return 0,0,0,0,0
 
 #IES_Intensity_matrix ----
 
@@ -151,7 +159,16 @@ def IES_Intensity_matrix (filename):
       if Num_hori_angle!=0:
         angle_horizontal, index = angles(IES, index,Num_hori_angle)
         mat=intensity_matrix (IES,index,Num_vert_angle,Num_hori_angle)
-  return mat
+      else:
+        raise ValueError("Check horizontal angles")
+        return 0
+      return mat
+    else:
+      raise ValueError("Check vertical angles")
+      return 0
+  else:
+    raise ValueError("Incorrect IES file does not meet photometric file parameters")
+    return 0
 
 #IES2PBRT ----
 
@@ -164,18 +181,31 @@ def IES2PBRT (filename):
       if Num_hori_angle!=0:
         angle_horizontal, index = angles(IES, index,Num_hori_angle)
         mat=intensity_matrix (IES,index,Num_vert_angle,Num_hori_angle)
-  mat=adjust_vert_angle(mat,angle_vertical,Num_vert_angle,Num_hori_angle)
-  mat=adjust_hor_angle(mat,angle_horizontal,Num_hori_angle)
-  img=PBRT_image(mat)
-  return img
+      else:
+        raise ValueError("Check horizontal angles")
+        return 0
+    else:
+      raise ValueError("Check vertical angles")
+      return 0
+    mat=adjust_vert_angle(mat,angle_vertical,Num_vert_angle,Num_hori_angle)
+    mat=adjust_hor_angle(mat,angle_horizontal,Num_hori_angle)
+    img=PBRT_image(mat)
+    return img
+  else:
+    raise ValueError("Incorrect IES file does not meet photometric file parameters")
+    return 0
 
 #PBRT save as EXR ----
 
 def save_EXR(img_normalized, ruta):
-  IMG_EXR=np.zeros((img_normalized.shape[0], img_normalized.shape[1],3))
-  IMG_EXR[:,:,0]=img_normalized
-  IMG_EXR[:,:,1]=img_normalized
-  IMG_EXR[:,:,2]=img_normalized
-  IMG_EXR = IMG_EXR.astype("float32")
-  cv2.imwrite(ruta, IMG_EXR)
-  return
+  if img_normalized.shape[0]==360 and img_normalized.shape[1]==720:
+    IMG_EXR=np.zeros((img_normalized.shape[0], img_normalized.shape[1],3))
+    IMG_EXR[:,:,0]=img_normalized
+    IMG_EXR[:,:,1]=img_normalized
+    IMG_EXR[:,:,2]=img_normalized
+    IMG_EXR = IMG_EXR.astype("float32")
+    cv2.imwrite(ruta, IMG_EXR)
+    return
+  else:
+    raise ValueError("Incorrect image file does not meet photometric file parameters")
+    return 0
