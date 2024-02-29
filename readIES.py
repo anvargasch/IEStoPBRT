@@ -133,8 +133,8 @@ def adjust_hor_angle(mat,angle_horizontal,Num_hori_angle):
 def PBRT_image (mat):
   resized = cv2.resize(mat, (720,360), interpolation = cv2.INTER_LINEAR)
   IES=np.rot90(resized, 2)
-  img_normalized = cv2.normalize(IES, None, 0, 1.0, cv2.NORM_MINMAX, dtype=cv2.CV_32F)
-  return img_normalized
+  #img_normalized = cv2.normalize(IES, None, 0, 1.0, cv2.NORM_MINMAX, dtype=cv2.CV_32F)
+  return IES
 
 """#General functions"""
 
