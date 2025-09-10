@@ -1,0 +1,5 @@
+# requirements.txt for IEStoPBRT
+
+numpy>=1.24
+imageio[freeimage]>=2.33
+matplotlib>=3.7
