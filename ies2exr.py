@@ -1,0 +1,157 @@
+# ies2exr.py
+# Robust IES → EXR converter for PBRT goniometric lights
+# Author: Angélica Vargas Chavarro + ChatGPT
+# Date: 2025-09-09
+# License: MIT
+
+import re
+import numpy as np
+import imageio.v3 as iio  # for saving EXR
+
+# -----------------------------
+# IES Parsing Utilities
+# -----------------------------
+
+def load_ies(filename: str):
+    """
+    Load an IES file and return its content as a list of lines
+    and the index where 'TILT=' appears.
+    """
+    with open(filename, "r", encoding="latin-1") as f:
+        content = f.read()
+    match = re.search(r"TILT=", content)
+    if not match:
+        raise ValueError("Invalid IES: missing 'TILT=' parameter")
+    lines = content.splitlines()
+    for i, line in enumerate(lines):
+        if "TILT=" in line:
+            return lines, i
+    raise ValueError("TILT section not found")
+
+
+def read_header(lines, idx: int):
+    """
+    Parse the header line after TILT and return key photometric parameters.
+    """
+    vals = lines[idx + 1].split()
+    lumens_per_lamp = float(vals[1])
+    candela_mult = float(vals[2])
+    n_vert = int(vals[3])
+    n_horz = int(vals[4])
+    units_type = int(vals[6])  # 1 = feet, 2 = meters
+    return lumens_per_lamp, candela_mult, n_vert, n_horz, units_type
+
+
+def read_angles(lines, idx: int, count: int):
+    """
+    Read vertical or horizontal angles, which may span multiple lines.
+    """
+    angles = []
+    while len(angles) < count:
+        parts = lines[idx].split()
+        angles.extend([float(x) for x in parts])
+        idx += 1
+    if len(angles) != count:
+        raise ValueError("Incorrect IES: angle count mismatch")
+    return np.array(angles, dtype=float), idx
+
+
+def read_intensity_matrix(lines, idx: int, n_vert: int, n_horz: int):
+    """
+    Read the intensity matrix (candela values).
+    """
+    values = []
+    while len(values) < n_horz * n_vert and idx < len(lines):
+        values.extend(lines[idx].split())
+        idx += 1
+    if len(values) != n_horz * n_vert:
+        raise ValueError("Incorrect IES: intensity count mismatch")
+    mat = np.array(values, dtype=float).reshape((n_horz, n_vert))
+    return mat.T  # shape (n_vert, n_horz)
+
+
+# -----------------------------
+# Adjustments for PBRT Mapping
+# -----------------------------
+
+def adjust_vertical(mat, v_angles, n_vert, n_horz):
+    """
+    Extend vertical angles from 0–90° to 0–180° by padding with zeros.
+    """
+    if v_angles[0] == 0 and v_angles[-1] == 90:
+        extra = np.linspace(90, 180, n_vert)[1:]
+        v_angles = np.concatenate((v_angles, extra))
+        zeros = np.zeros((len(extra), n_horz))
+        mat = np.concatenate((mat, zeros), axis=0)
+    return mat, v_angles
+
+
+def adjust_horizontal(mat, h_angles, n_horz):
+    """
+    Extend horizontal angles (0–90° or 0–180°) to full 360° using mirroring.
+    """
+    if h_angles[0] == 0 and h_angles[-1] == 90:
+        extra = np.linspace(90, 180, n_horz)[1:]
+        h_angles = np.concatenate((h_angles, extra))
+        mirror = mat[:, ::-1][:, 1:]
+        mat = np.concatenate((mat, mirror), axis=1)
+    elif h_angles[0] == 0 and h_angles[-1] == 180:
+        extra = np.linspace(180, 360, n_horz)[1:]
+        h_angles = np.concatenate((h_angles, extra))
+        mirror = mat[:, ::-1][:, 1:]
+        mat = np.concatenate((mat, mirror), axis=1)
+    return mat, h_angles
+
+
+def to_pbrt_image(mat, width=720, height=360):
+    """
+    Resample the intensity matrix to a fixed lat-long image for PBRT.
+    """
+    import cv2
+    resized = cv2.resize(mat, (width, height), interpolation=cv2.INTER_LINEAR)
+    return np.rot90(resized, 2)
+
+
+# -----------------------------
+# Conversion Function
+# -----------------------------
+
+def ies_to_exr(filename: str, out_exr: str, width=720, height=360):
+    """
+    Convert an IES photometric distribution into an EXR lat-long image
+    usable in PBRT as a goniometric light source.
+    """
+    lines, idx = load_ies(filename)
+    lumens, factor, n_vert, n_horz, units = read_header(lines, idx)
+    v_angles, idx = read_angles(lines, idx + 3, n_vert)
+    h_angles, idx = read_angles(lines, idx, n_horz)
+    mat = read_intensity_matrix(lines, idx, n_vert, n_horz)
+
+    # Adjust angles for PBRT full coverage
+    mat, v_angles = adjust_vertical(mat, v_angles, n_vert, n_horz)
+    mat, h_angles = adjust_horizontal(mat, h_angles, n_horz)
+
+    # Generate image
+    img = to_pbrt_image(mat, width, height)
+
+    # Save EXR (3 channels identical)
+    exr = np.repeat(img[:, :, None], 3, axis=2).astype(np.float32)
+    iio.imwrite(out_exr, exr, extension=".exr")
+
+    return {
+        "lumens": lumens,
+        "factor": factor,
+        "units": units,
+        "v_angles": v_angles.shape[0],
+        "h_angles": h_angles.shape[0],
+        "out_exr": out_exr,
+    }
+
+
+# -----------------------------
+# Example
+# -----------------------------
+
+if __name__ == "__main__":
+    meta = ies_to_exr("luminaire.ies", "luminaire.exr")
+    print(meta)
