@@ -24,11 +24,3 @@ Clone the repository:
 ```bash
 git clone https://github.com/<your-username>/IEStoPBRT.git
 cd IEStoPBRT
-
-## ▶️ Run in Google Colab
-
-You can try the conversion workflow directly in Google Colab using the example notebook:
-
-<a href="https://colab.research.google.com/github/anvargasch/IEStoPBRT/blob/main/Example.ipynb" target="_parent">
-  <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/>
-</a>
