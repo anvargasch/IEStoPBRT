@@ -333,7 +333,7 @@ def try_makeequiarea(imgtool: str, latlong_exr: str, out_ea_exr: str):
 # =========================
 # Main
 # =========================
-def ies_to_exr(ies_path: str,
+def ies2exr(ies_path: str,
                        out_exr: str,
                        size: int = 1024,
                        also_write_latlong: bool = False,
@@ -375,7 +375,7 @@ def main():
     ap.add_argument("--keep-latlong", action="store_true", help="Guardar también el latlong intermedio")
     args = ap.parse_args()
 
-    out, latlong = ies_to_exr(
+    out, latlong = ies2exr(
         ies_path=args.ies,
         out_exr=args.out,
         size=args.size,
@@ -390,4 +390,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
