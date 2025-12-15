@@ -180,13 +180,25 @@ def save_exr(path, img):
 # ============================================================
 # PUBLIC API (NOTEBOOK)
 # ============================================================
-def ies_to_exr(filename, output, size=1024):
+def ies_to_exr(filename: str, output: str, size: int = 1024):
     ies = load_ies_type_c(filename)
     cd, v = ensure_vertical(ies.cd, ies.v_angles_deg)
     cd, h = complete_horizontal(cd, ies.h_angles_deg)
+
     img = build_latlong_normalized(cd, v, h, size)
     save_exr(output, img)
-    return output
+
+    meta = {
+        "ies_file": os.path.basename(filename),
+        "output_exr": output,
+        "resolution": size,
+        "photometric_type": ies.photometric_type,
+        "units_type": ies.units_type,
+        "angular_normalization": "integral_over_4pi_equals_1",
+        "recommended_power_lm": None
+    }
+    return meta
+
 
 
 # ============================================================
@@ -205,3 +217,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
