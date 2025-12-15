@@ -1,307 +1,392 @@
-# ies2exr.py
-# Robust IES → EXR (square map for PBRT goniometric lights)
-# Author: Angélica Vargas Chavarro + ChatGPT
-# Date: 2025-11-27 (normalized for PBRT "power" = luminous flux)
-# License: MIT
-
-import re
-import numpy as np
+import argparse
 import math
-import pyexr   # 👉 ahora usamos pyexr
+import os
+import re
+import subprocess
+from dataclasses import dataclass
+from typing import Tuple, Optional
+
+import numpy as np
+import pyexr
 
 
-# -----------------------------
-# Utility: save EXR using pyexr
-# -----------------------------
-def save_exr(filename: str, img: np.ndarray):
-    """
-    Save a float32 numpy array (H,W) or (H,W,3) as an EXR file using pyexr.
-    """
-    if img.ndim == 2:  # grayscale
-        img = np.repeat(img[:, :, None], 3, axis=2)
-    elif img.shape[2] != 3:
-        raise ValueError("Image must have 1 or 3 channels")
-
-    img = img.astype(np.float32)
-    pyexr.write(filename, img)
-    print(f"✅ EXR saved to {filename}")
+# =========================
+# IES parsing (LM-63)
+# =========================
+@dataclass
+class IESData:
+    v_angles_deg: np.ndarray          # (nV,)
+    h_angles_deg: np.ndarray          # (nH,) (tal como venga en el archivo)
+    cd: np.ndarray                    # (nV, nH) candelas
+    photometric_type: int
+    units_type: int
 
 
-# -----------------------------
-# IES Parsing Utilities
-# -----------------------------
-def load_ies(filename: str):
-    with open(filename, "r", encoding="latin-1") as f:
-        content = f.read()
-    match = re.search(r"TILT=", content)
-    if not match:
-        raise ValueError("Invalid IES: missing 'TILT='")
-    lines = content.splitlines()
+def _find_tilt_index(lines):
     for i, line in enumerate(lines):
-        if "TILT=" in line:
-            return lines, i
-    raise ValueError("Invalid IES: TILT section not found")
+        if "TILT=" in line.upper():
+            return i
+    raise ValueError("IES inválido: no se encontró 'TILT='.")
 
 
-def read_header(lines, idx: int):
-    """
-    Lee la línea numérica principal después de TILT=.
-
-    Formato típico LM-63:
-    [num_lamps] [lumens_per_lamp] [candela_mult] [n_vert] [n_horz]
-    [photometric_type] [units_type] [width] [length] [height] ...
-    """
-    vals = lines[idx + 1].split()
-    if len(vals) < 7:
-        raise ValueError("IES header line seems incomplete")
-
-    num_lamps        = int(vals[0])
-    lumens_per_lamp  = float(vals[1])
-    candela_mult     = float(vals[2])
-    n_vert           = int(vals[3])
-    n_horz           = int(vals[4])
-    photometric_type = int(vals[5])  # no lo usamos de momento
-    units_type       = int(vals[6])  # 1=feet, 2=meters
-
-    return num_lamps, lumens_per_lamp, candela_mult, n_vert, n_horz, units_type
-
-
-def read_angles(lines, idx: int, count: int):
-    angles = []
-    while len(angles) < count:
-        parts = lines[idx].split()
-        angles.extend([float(x) for x in parts])
+def _read_floats_from_lines(lines, start_idx, count) -> Tuple[np.ndarray, int]:
+    vals = []
+    idx = start_idx
+    while len(vals) < count and idx < len(lines):
+        parts = lines[idx].strip().split()
+        if parts:
+            vals.extend([float(p) for p in parts])
         idx += 1
-    if len(angles) != count:
-        raise ValueError("IES: angle count mismatch")
-    return np.array(angles, dtype=float), idx
+    if len(vals) != count:
+        raise ValueError(f"IES inválido: se esperaban {count} valores, llegaron {len(vals)}.")
+    return np.array(vals, dtype=float), idx
 
 
-def read_intensity_matrix(lines, idx: int, n_vert: int, n_horz: int):
-    values = []
-    while len(values) < n_horz * n_vert and idx < len(lines):
-        values.extend(lines[idx].split())
+def _read_matrix_from_lines(lines, start_idx, n_rows, n_cols) -> Tuple[np.ndarray, int]:
+    # En IES, los datos suelen venir por planos horizontales (nH) con nV valores cada uno.
+    # Nosotros lo reordenamos a (nV, nH).
+    needed = n_rows * n_cols
+    vals = []
+    idx = start_idx
+    while len(vals) < needed and idx < len(lines):
+        parts = lines[idx].strip().split()
+        if parts:
+            vals.extend([float(p) for p in parts])
         idx += 1
-    if len(values) != n_horz * n_vert:
-        raise ValueError("IES: intensity count mismatch")
-    mat = np.array(values, dtype=float).reshape((n_horz, n_vert))
-    return mat.T  # shape (n_vert, n_horz)
+    if len(vals) != needed:
+        raise ValueError(f"IES inválido: se esperaban {needed} intensidades, llegaron {len(vals)}.")
+    mat = np.array(vals, dtype=float).reshape((n_rows, n_cols))
+    return mat, idx
 
 
-# -----------------------------
-# Angle Adjustments
-# -----------------------------
-def adjust_vertical(mat, v_angles, n_vert, n_horz):
-    """If vertical angles cover only 0–90°, extend to 180° with zeros."""
-    if v_angles[0] == 0 and v_angles[-1] == 90:
-        extra = np.linspace(90, 180, n_vert)[1:]
-        v_angles = np.concatenate((v_angles, extra))
-        zeros = np.zeros((len(extra), n_horz))
-        mat = np.concatenate((mat, zeros), axis=0)
-    return mat, v_angles
+def load_ies_type_c(path: str) -> IESData:
+    with open(path, "r", encoding="latin-1") as f:
+        lines = f.read().splitlines()
 
+    t_idx = _find_tilt_index(lines)
+    tilt_line = lines[t_idx].strip().upper()
 
-def adjust_horizontal(mat, h_angles, n_horz):
-    """Make horizontal coverage full 0–360° by mirroring if needed."""
-    if h_angles[0] == 0 and h_angles[-1] == 90:
-        # 0–90 → extender a 0–180, luego espejar para 0–360
-        extra = np.linspace(90, 180, n_horz)[1:]
-        h_angles = np.concatenate((h_angles, extra))
-        mirror = mat[:, ::-1][:, 1:]
-        mat = np.concatenate((mat, mirror), axis=1)
-    elif h_angles[0] == 0 and h_angles[-1] == 180:
-        # 0–180 → espejar para 0–360
-        extra = np.linspace(180, 360, n_horz)[1:]
-        h_angles = np.concatenate((h_angles, extra))
-        mirror = mat[:, ::-1][:, 1:]
-        mat = np.concatenate((mat, mirror), axis=1)
-    return mat, h_angles
-
-
-# -----------------------------
-# Photometric integration
-# -----------------------------
-def compute_luminous_flux_cd(
-    mat_cd: np.ndarray,
-    v_angles_deg: np.ndarray,
-    h_angles_deg: np.ndarray
-) -> float:
-    """
-    Calcula el flujo luminoso integrando la distribución de intensidad en cd.
-
-    mat_cd:  (n_vert, n_horz) en cd
-    v_angles_deg: ángulos verticales en grados (0..180)
-    h_angles_deg: ángulos horizontales en grados (0..360)
-
-    Φ ≈ Σ I(θ_i,φ_j) * ΔΩ_ij, con
-    ΔΩ_ij = (φ_{j+1}-φ_j)*(cos θ_i - cos θ_{i+1})
-    """
-
-    v = np.deg2rad(v_angles_deg)
-    h = np.deg2rad(h_angles_deg)
-
-    n_v = len(v)
-    n_h = len(h)
-
-    if n_v < 1 or n_h < 1:
-        raise ValueError("Empty angle arrays for luminous flux computation")
-
-    # Bordes en vertical (clamp a 0..π)
-    v_edges = np.empty(n_v + 1, dtype=float)
-    if n_v == 1:
-        v_edges[0] = 0.0
-        v_edges[1] = math.pi
+    if tilt_line.startswith("TILT="):
+        tilt_mode = tilt_line.split("=", 1)[1].strip()
     else:
-        v_edges[1:-1] = 0.5 * (v[:-1] + v[1:])
-        v_edges[0] = max(0.0, v[0] - 0.5 * (v[1] - v[0]))
-        v_edges[-1] = min(math.pi, v[-1] + 0.5 * (v[-1] - v[-2]))
+        tilt_mode = "NONE"
 
-    # Bordes en horizontal (forzamos 0..2π)
-    h_edges = np.empty(n_h + 1, dtype=float)
-    if n_h == 1:
-        h_edges[0] = 0.0
-        h_edges[1] = 2 * math.pi
-    else:
-        h_edges[1:-1] = 0.5 * (h[:-1] + h[1:])
-        h_edges[0] = 0.0
-        h_edges[-1] = 2 * math.pi
+    # Leemos línea numérica principal (después de TILT=...)
+    header_tokens = lines[t_idx + 1].split()
+    if len(header_tokens) < 7:
+        raise ValueError("IES inválido: cabecera numérica incompleta después de TILT=.")
 
-    dphi = np.diff(h_edges)  # (n_h,)
+    num_lamps = int(header_tokens[0])
+    lumens_per_lamp = float(header_tokens[1])  # no lo usamos aquí
+    candela_mult = float(header_tokens[2])
+    n_vert = int(header_tokens[3])
+    n_horz = int(header_tokens[4])
+    photometric_type = int(header_tokens[5])   # 1=Type C (en muchos LM-63)
+    units_type = int(header_tokens[6])         # 1=feet, 2=meters
 
-    phi_total = 0.0
-    for i in range(n_v):
-        theta0 = v_edges[i]
-        theta1 = v_edges[i + 1]
-        domega_row = (math.cos(theta0) - math.cos(theta1))
-        phi_total += np.sum(mat_cd[i, :] * domega_row * dphi)
+    # Saltar bloque TILT si no es NONE
+    # Para evitar “mugre” y comportamientos inesperados, sólo soportamos NONE de forma estricta.
+    if tilt_mode not in ("NONE", "NO", "NONE\r"):
+        raise ValueError(
+            f"TILT={tilt_mode} no soportado en esta versión final. "
+            "Exporta el IES con TILT=NONE o aplícalo en el software fotométrico antes."
+        )
 
-    return float(phi_total)  # lumens
+    # En LM-63, después de la cabecera suelen venir 3 números adicionales (ballast/future use/watts)
+    # Muchas veces están en la línea t_idx+2, pero no siempre; se manejan consumiendo el bloque de ángulos.
+    # Usamos el layout clásico: v_angles empiezan en t_idx+3.
+    idx = t_idx + 2
+    # Consumir posibles líneas numéricas “extra” hasta que empecemos a leer ángulos.
+    # (Estrategia robusta: leemos v_angles con el contador exacto desde idx+1)
+    idx = t_idx + 2
+
+    # Heurística robusta:
+    # buscamos el punto donde podamos leer n_vert floats seguidos; asumimos que es la línea siguiente a los "3 extras".
+    # En la práctica, suele ser t_idx+3. Si falla, retrocedemos/avanzamos.
+    start_try = t_idx + 2
+    found = None
+    for k in range(6):  # prueba unas pocas líneas hacia adelante
+        try:
+            v_angles, idx_after_v = _read_floats_from_lines(lines, start_try + k, n_vert)
+            h_angles, idx_after_h = _read_floats_from_lines(lines, idx_after_v, n_horz)
+            # si esto funcionó, asumimos correcto
+            found = (v_angles, h_angles, idx_after_h)
+            break
+        except Exception:
+            continue
+    if found is None:
+        raise ValueError("No fue posible localizar los bloques de ángulos (vertical/horizontal).")
+
+    v_angles, h_angles, idx = found
+
+    # Intensidades
+    mat_hv, idx2 = _read_matrix_from_lines(lines, idx, n_horz, n_vert)  # (nH, nV)
+    mat_vh = mat_hv.T                                                   # (nV, nH)
+    cd = mat_vh * float(candela_mult)
+
+    # Orden ascendente por seguridad (si el archivo viniera desordenado)
+    v_sort = np.argsort(v_angles)
+    v_angles = v_angles[v_sort]
+    cd = cd[v_sort, :]
+
+    h_sort = np.argsort(h_angles)
+    h_angles = h_angles[h_sort]
+    cd = cd[:, h_sort]
+
+    return IESData(
+        v_angles_deg=v_angles.astype(float),
+        h_angles_deg=h_angles.astype(float),
+        cd=cd.astype(float),
+        photometric_type=photometric_type,
+        units_type=units_type
+    )
 
 
-def normalize_latlong_image(img: np.ndarray):
+# =========================
+# Angular completion (Type C)
+# =========================
+def _complete_horizontal_0_360(cd: np.ndarray, h_deg: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Normaliza un mapa lat-long para que ∫ f(θ,φ) dΩ ≈ 1.
-
-    img: (N,N) con θ ∈ [0,π], φ ∈ [0,2π]
-    Return: (img_norm, integral_original)
+    Completa h a [0,360) con simetrías típicas (0..90, 0..180, 0..360).
+    Asume h inicia en 0.
     """
-    H, W = img.shape
-    if H != W:
-        raise ValueError("Lat-long image should be square (H == W)")
-    N = H
+    h = np.array(h_deg, dtype=float)
+    if abs(h[0] - 0.0) > 1e-6:
+        raise ValueError("Se requiere que los ángulos horizontales inicien en 0° para completar simetrías.")
 
-    # Centro de cada fila en θ
-    theta = math.pi * (np.arange(N) + 0.5) / N  # (N,)
-    sin_theta = np.sin(theta)[:, None]          # (N,1)
+    hmax = float(h[-1])
 
+    # Caso 0..360 (con o sin 360 repetido)
+    if abs(hmax - 360.0) < 1e-6:
+        # si incluye 360 como duplicado de 0, lo removemos para interpolación periódica limpia
+        if len(h) > 1 and abs(h[-1] - 360.0) < 1e-6:
+            h = h[:-1]
+            cd = cd[:, :-1]
+        return cd, h
+
+    # Caso 0..180 -> espejo a 360
+    if abs(hmax - 180.0) < 1e-6:
+        h_inner = h[1:-1]
+        h_mirr = 360.0 - h_inner[::-1]
+        cd_inner = cd[:, 1:-1]
+        cd_mirr = cd_inner[:, ::-1]
+        h_full = np.concatenate([h, h_mirr])
+        cd_full = np.concatenate([cd, cd_mirr], axis=1)
+        return cd_full, h_full
+
+    # Caso 0..90 -> espejo a 180 y luego a 360
+    if abs(hmax - 90.0) < 1e-6:
+        # 0..90 -> 0..180
+        h_inner = h[1:-1]
+        h_180_mirr = 180.0 - h_inner[::-1]
+        cd_inner = cd[:, 1:-1]
+        cd_180_mirr = cd_inner[:, ::-1]
+        h_180 = np.concatenate([h, h_180_mirr])
+        cd_180 = np.concatenate([cd, cd_180_mirr], axis=1)
+
+        # 0..180 -> 0..360
+        h_inner2 = h_180[1:-1]
+        h_360_mirr = 360.0 - h_inner2[::-1]
+        cd_inner2 = cd_180[:, 1:-1]
+        cd_360_mirr = cd_inner2[:, ::-1]
+        h_full = np.concatenate([h_180, h_360_mirr])
+        cd_full = np.concatenate([cd_180, cd_360_mirr], axis=1)
+        return cd_full, h_full
+
+    raise ValueError(f"Rango horizontal no soportado automáticamente: 0..{hmax}°.")
+
+
+def _ensure_vertical_0_180(cd: np.ndarray, v_deg: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Asegura soporte vertical 0..180:
+    - Si llega 0..90: extiende 90..180 con ceros.
+    - Si llega 0..180: deja igual.
+    """
+    v = np.array(v_deg, dtype=float)
+    vmax = float(v[-1])
+
+    if vmax <= 90.0 + 1e-6:
+        # Extender a 180 con ceros, manteniendo resolución similar (paso medio)
+        if len(v) >= 2:
+            step = float(np.median(np.diff(v)))
+            step = step if step > 0 else 1.0
+        else:
+            step = 1.0
+        v_ext = np.arange(vmax + step, 180.0 + 1e-6, step, dtype=float)
+        if v_ext.size == 0:
+            # ya está en 90 exacto sin más
+            v_full = v
+            cd_full = cd
+        else:
+            cd_zeros = np.zeros((cd.shape[0] + v_ext.size, cd.shape[1]), dtype=float)
+            cd_zeros[: cd.shape[0], :] = cd
+            v_full = np.concatenate([v, v_ext])
+            cd_full = cd_zeros
+        return cd_full, v_full
+
+    if abs(vmax - 180.0) < 1e-6 or vmax < 180.0 + 1e-6:
+        return cd, v
+
+    raise ValueError(f"Ángulos verticales fuera de rango esperado: max={vmax}°.")
+
+
+# =========================
+# Irregular bilinear interpolation in (theta, phi)
+# =========================
+def _sample_cd_irregular_bilinear(cd_vh: np.ndarray,
+                                  v_deg: np.ndarray,
+                                  h_deg_0_360: np.ndarray,
+                                  theta_deg: np.ndarray,
+                                  phi_deg: np.ndarray) -> np.ndarray:
+    """
+    Interpola bilinealmente en una grilla irregular (v,h).
+    - v: 0..180
+    - h: 0..360 (sin 360 repetido)
+    - phi se trata periódico.
+    """
+    v = np.array(v_deg, dtype=float)
+    h = np.array(h_deg_0_360, dtype=float)
+
+    # wrap phi a [0,360)
+    phi = np.mod(phi_deg, 360.0)
+    theta = np.array(theta_deg, dtype=float)
+
+    # Cierre periódico en h: añadimos columna extra en 360 igual a 0
+    h_ext = np.concatenate([h, [h[0] + 360.0]])
+    cd_ext = np.concatenate([cd_vh, cd_vh[:, 0:1]], axis=1)
+
+    # índices theta
+    i1 = np.searchsorted(v, theta, side="right")
+    i0 = np.clip(i1 - 1, 0, len(v) - 1)
+    i1 = np.clip(i1,     0, len(v) - 1)
+    v0 = v[i0]
+    v1 = v[i1]
+    tv = np.where(v1 > v0, (theta - v0) / (v1 - v0), 0.0)
+
+    # índices phi
+    j1 = np.searchsorted(h_ext, phi, side="right")
+    j0 = np.clip(j1 - 1, 0, len(h_ext) - 2)
+    j1 = np.clip(j1,     1, len(h_ext) - 1)
+    h0 = h_ext[j0]
+    h1 = h_ext[j1]
+    tp = np.where(h1 > h0, (phi - h0) / (h1 - h0), 0.0)
+
+    I00 = cd_ext[i0, j0]
+    I01 = cd_ext[i0, j1]
+    I10 = cd_ext[i1, j0]
+    I11 = cd_ext[i1, j1]
+
+    I0 = I00 * (1 - tp) + I01 * tp
+    I1 = I10 * (1 - tp) + I11 * tp
+    I = I0 * (1 - tv) + I1 * tv
+    return I
+
+
+# =========================
+# Lat-long build + solid-angle normalization
+# =========================
+def build_latlong_normalized(cd_vh: np.ndarray, v_deg: np.ndarray, h_deg: np.ndarray, size: int) -> np.ndarray:
+    """
+    Construye imagen lat-long (H=W=size):
+    - filas: theta 0..180
+    - columnas: phi 0..360
+    Luego normaliza para que ∫ f dΩ = 1.
+    """
+    N = int(size)
+    theta = 180.0 * (np.arange(N) + 0.5) / N  # (N,)
+    phi = 360.0 * (np.arange(N) + 0.5) / N    # (N,)
+
+    TH, PH = np.meshgrid(theta, phi, indexing="ij")
+    img = _sample_cd_irregular_bilinear(cd_vh, v_deg, h_deg, TH, PH).astype(np.float64)
+
+    # Normalización por ángulo sólido
+    theta_r = math.pi * (np.arange(N) + 0.5) / N
+    sin_theta = np.sin(theta_r)[:, None]
     dtheta = math.pi / N
     dphi = 2 * math.pi / N
-
-    weights = sin_theta * (dtheta * dphi)      # (N,N) vía broadcasting
+    weights = sin_theta * (dtheta * dphi)
     integral = float(np.sum(img * weights))
-
     if integral <= 0:
-        raise ValueError("Non-positive integral for lat-long image normalization")
-
-    img_norm = img / integral
-    return img_norm, integral
-
-
-# -----------------------------
-# Mapping to PBRT image (square)
-# -----------------------------
-def to_pbrt_image(mat, size: int = 512):
-    """Resample intensity matrix to a square image (size x size).
-
-    Se asume que la matriz está indexada como [vertical, horizontal].
-    """
-    import cv2
-    resized = cv2.resize(mat, (size, size), interpolation=cv2.INTER_LINEAR)
-    # Rotar 180° para mantener la convención que venías usando
-    return np.rot90(resized, 2)
+        raise ValueError("No se pudo normalizar: integral no positiva.")
+    img /= integral
+    return img
 
 
-# -----------------------------
-# Conversion Function
-# -----------------------------
-def ies_to_exr(filename: str, out_exr: str, size: int = 512):
-    """
-    Convierte un archivo IES a un EXR cuadrado (size x size) normalizado tal que:
-        ∫_sphere tex(θ,φ) dΩ ≈ 1
-
-    Así, en PBRT:
-        LightSource "goniometric" ... "float power" [Φ]
-    el parámetro 'power' coincide con el flujo luminoso Φ (lm) integrado
-    a partir de la distribución IES.
-    """
-    lines, idx = load_ies(filename)
-
-    (
-        num_lamps,
-        lumens_per_lamp,
-        candela_mult,
-        n_vert,
-        n_horz,
-        units,
-    ) = read_header(lines, idx)
-
-    # Bloques de ángulos
-    v_angles, idx = read_angles(lines, idx + 3, n_vert)
-    h_angles, idx = read_angles(lines, idx, n_horz)
-
-    # Matriz de intensidades
-    mat = read_intensity_matrix(lines, idx, n_vert, n_horz)
-
-    # Ajuste de cobertura angular a 0–180 y 0–360
-    mat, v_angles = adjust_vertical(mat, v_angles, n_vert, n_horz)
-    mat, h_angles = adjust_horizontal(mat, h_angles, n_horz)
-
-    # Aplicar factor de candelas -> matriz en cd
-    mat_cd = mat * candela_mult
-
-    # Flujo luminoso integrado a partir de la distribución en cd
-    phi_lum_ies = compute_luminous_flux_cd(mat_cd, v_angles, h_angles)
-
-    # Flujo de lámparas desde cabecera (informativo)
-    phi_lamps_header = num_lamps * lumens_per_lamp
-
-    # 1) Pasamos la matriz de intensidades en cd al mapa NxN
-    img_cd = to_pbrt_image(mat_cd, size=size)   # (N,N) en cd (aprox)
-
-    # 2) Normalizamos como lat-long: integral ≈ 1
-    img_norm, integral_before = normalize_latlong_image(img_cd)
-
-    # Asegurar float32 y convertir a RGB
-    exr = np.repeat(img_norm[:, :, None], 3, axis=2).astype(np.float32)
-
-    # Guardar EXR con pyexr
-    save_exr(out_exr, exr)
-
-    return {
-        "num_lamps": num_lamps,
-        "lumens_per_lamp_header": lumens_per_lamp,
-        "candela_mult": candela_mult,
-        "lumens_from_ies_integration": phi_lum_ies,
-        "lumens_from_header_lamps": phi_lamps_header,
-        "units_type": units,      # 1=ft, 2=m
-        "v_angles_count": v_angles.shape[0],
-        "h_angles_count": h_angles.shape[0],
-        "image_size": size,
-        "latlong_integral_before_norm": integral_before,
-        "out_exr": out_exr,
-        # Valor de 'power' recomendado en PBRT:
-        "recommended_power_lm": phi_lum_ies,
-    }
+def save_exr_gray_as_rgb(path: str, img: np.ndarray):
+    if img.ndim != 2:
+        raise ValueError("Se esperaba imagen 2D (grayscale).")
+    rgb = np.repeat(img[:, :, None], 3, axis=2).astype(np.float32)
+    pyexr.write(path, rgb)
 
 
-# -----------------------------
-# Example
-# -----------------------------
-if __name__ == "__main__":
-    meta = ies_to_exr(
-        "IESfiles/IESsiemens.ies",
-        "IESsiemens_square.exr",
-        size=1024
+# =========================
+# Optional: call PBRT imgtool makeequiarea
+# =========================
+def try_makeequiarea(imgtool: str, latlong_exr: str, out_ea_exr: str):
+    cmd = [imgtool, "makeequiarea", latlong_exr, out_ea_exr]
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode != 0:
+        raise RuntimeError(f"imgtool makeequiarea falló:\n{p.stderr.strip()}")
+    return True
+
+
+# =========================
+# Main
+# =========================
+def convert_ies_to_exr(ies_path: str,
+                       out_exr: str,
+                       size: int = 1024,
+                       also_write_latlong: bool = False,
+                       imgtool_path: Optional[str] = None) -> Tuple[str, Optional[str]]:
+    ies = load_ies_type_c(ies_path)
+
+    cd, v = _ensure_vertical_0_180(ies.cd, ies.v_angles_deg)
+    cd, h = _complete_horizontal_0_360(cd, ies.h_angles_deg)
+
+    img_latlong = build_latlong_normalized(cd, v, h, size=size)
+
+    latlong_path = None
+    if also_write_latlong or (imgtool_path is not None):
+        latlong_path = os.path.splitext(out_exr)[0] + "_latlong.exr"
+        save_exr_gray_as_rgb(latlong_path, img_latlong)
+
+    # Si hay imgtool, convertimos a octahedral equal-area para PBRT v4
+    if imgtool_path is not None:
+        # si no se escribió latlong todavía, se escribe ahora
+        if latlong_path is None:
+            latlong_path = os.path.splitext(out_exr)[0] + "_latlong.exr"
+            save_exr_gray_as_rgb(latlong_path, img_latlong)
+
+        try_makeequiarea(imgtool_path, latlong_path, out_exr)
+    else:
+        # Sin imgtool, dejamos latlong como salida (si out_exr apunta directo)
+        # Para evitar confusión, si no hay imgtool y no se pidió latlong, igual escribimos out_exr como latlong.
+        save_exr_gray_as_rgb(out_exr, img_latlong)
+
+    return out_exr, latlong_path
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("ies", help="Archivo .ies (Type C)")
+    ap.add_argument("-o", "--out", required=True, help="EXR de salida (idealmente EA si usas imgtool)")
+    ap.add_argument("-s", "--size", type=int, default=1024, help="Resolución (NxN), recomendado 1024")
+    ap.add_argument("--imgtool", default=None, help="Ruta a imgtool (PBRT). Si se da, genera EXR octahedral EA.")
+    ap.add_argument("--keep-latlong", action="store_true", help="Guardar también el latlong intermedio")
+    args = ap.parse_args()
+
+    out, latlong = convert_ies_to_exr(
+        ies_path=args.ies,
+        out_exr=args.out,
+        size=args.size,
+        also_write_latlong=args.keep_latlong,
+        imgtool_path=args.imgtool
     )
-    print(meta)
-    print(f"Sugerencia PBRT -> float power = {meta['recommended_power_lm']:.2f}")
+
+    print(f"OK: {out}")
+    if latlong:
+        print(f"LatLong: {latlong}")
+
+
+if __name__ == "__main__":
+    main()
